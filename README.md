@@ -132,7 +132,16 @@ instead of a random one that sends a quarter of the pods to the Pi. Pods labelle
 `kaptain.io/phase=eval` or `valid` (`KEXP_PHASE`) freeze
 the policy: best node (a tie drawn at random), no update. `shortest-estimate` is the paper's simple
 rule on the same estimates; `earliest-finish` adds the work left on each node, shared over its
-cores: the load-aware rule Kaptain must beat when contention matters. Estimates and weights live
+cores: the load-aware rule Kaptain must beat when contention matters. It queues the new pod
+behind the others, which run beside it within their limits, so it overestimates a busy node,
+the 8-core worker most. `earliest-finish-fixed` and `earliest-finish-learned` slow the estimate
+instead: minus the pod's runtime alone there times (1 + alpha occ), occ the CPU requested on the
+node, the pod included, over its cores. alpha is 1 for `-fixed`, a node fully booked runs a pod
+twice as long; `-learned` fits it per node on the pods of 10 s or more that finished there, with the occupancy when each
+started
+(`kaptain_slowdown` in the decider's log), 1 until 20 have. Both learn the runtime alone,
+dividing each runtime by its slowdown, so the load is not counted twice. `-ef` keeps
+`earliest-finish`'s prior. Estimates and weights live
 in the decider's memory: a redeployment starts from scratch, but each update logs the weights
 (`kaptain_checkpoint`). `KAPTAIN_SEED` (default 7) seeds
 Kaptain's networks and sampling, for independent trainings of one policy.
@@ -162,9 +171,10 @@ k8s/         manifests
 
 **A fallback is a result.** A policy that crashes, times out, or names a node outside the
 candidate list must never become an invisible random baseline. The plugin validates every
-answer and falls back explicitly — highest mean remaining CPU/memory request ratio once the
-incoming Pod is added, then allocatable CPU, then node name. That is the same definition as
-the `least-allocated` strategy, so the fallback matches the name it carries. The rule lives
+answer and falls back explicitly — `most-free-cpu-requests`: the most millicores left
+unrequested once the incoming Pod is added, then allocatable CPU, then node name. Absolute
+cores, not a ratio: until now it was the `least-allocated` strategy, whose CPU and memory ratios
+sent most pods to the slow Pi. The rule lives
 **in Go, because it runs exactly when the decider is what failed**. It is logged, counted,
 and kept in the results; when it ranked on resources a node reported missing, the decision
 line names those nodes in `fallback_blind_nodes`.

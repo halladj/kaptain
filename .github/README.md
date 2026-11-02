@@ -9,7 +9,8 @@ Open **Actions -> select a workflow -> Run workflow** on the default branch.
 - **Run campaign** runs every experiment × policy × seed listed. Default: `even-5s` and
   `even-10s`; Kaptain (delay only), earliest-finish, shortest-estimate, least-allocated and
   Kubernetes' own `default-scheduler`; seeds 7 to 11. Each policy is deployed afresh for each
-  experiment. The policies that learn (Kaptain, shortest-estimate, earliest-finish) first train
+  experiment. The policies that learn (Kaptain, shortest-estimate, earliest-finish and its -fixed and -learned
+  variants) first train
   on `train_runs` other seeds (1000, 1001, ...), then every policy runs the evaluated seeds,
   Kaptain frozen. Each Kaptain policy does it `replicates` times, independent trainings
   (`KAPTAIN_SEED` 1, 2, ...); with `validate_every` set, every that many training runs it also

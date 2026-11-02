@@ -24,6 +24,9 @@ on:
         options:
           - current
           - dummy-random
+          - earliest-finish
+          - earliest-finish-fixed
+          - earliest-finish-learned
           - largest-cpu-capacity
           - least-allocated
           - least-used
