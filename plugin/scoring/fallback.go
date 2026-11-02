@@ -8,7 +8,7 @@ import (
 
 // FallbackName runs when something else already failed, so it uses no telemetry of its own.
 // A fallback is a decision of the method under test: logged, counted, kept in the results.
-const FallbackName = "least-allocated-requests"
+const FallbackName = "most-free-cpu-requests"
 
 // fallbackIncomplete reports the candidates whose allocatable or requested resources are
 // missing. The fallback still has to answer -- it runs when something else already failed
@@ -30,8 +30,8 @@ func fallbackNode(s *snapshot.Snapshot) string {
 	nodes := append([]snapshot.Node(nil), s.Nodes...)
 	sort.Slice(nodes, func(i, j int) bool {
 		left, right := nodes[i], nodes[j]
-		if free := freeRatio(left, s.Pod); free != freeRatio(right, s.Pod) {
-			return free > freeRatio(right, s.Pod)
+		if free := freeMilliCPU(left, s.Pod); free != freeMilliCPU(right, s.Pod) {
+			return free > freeMilliCPU(right, s.Pod)
 		}
 		if left.AllocatableMilliCPU != right.AllocatableMilliCPU {
 			return left.AllocatableMilliCPU > right.AllocatableMilliCPU
@@ -56,19 +56,10 @@ func fallbackScores(s *snapshot.Snapshot) map[string]float64 {
 	return scores
 }
 
-// freeRatio is the mean of the CPU and memory ratios left once the incoming Pod is added,
-// which is the same definition as the least-allocated strategy in bridge/strategies. The
-// fallback is named after it, so it has to compute it: CPU alone was a different rule under
-// the same name.
-func freeRatio(n snapshot.Node, pod snapshot.Pod) float64 {
-	cpu := free(n.AllocatableMilliCPU, n.RequestedMilliCPU+pod.RequestedMilliCPU)
-	memory := free(n.AllocatableMemoryBytes, n.RequestedMemoryBytes+pod.RequestedMemoryBytes)
-	return (cpu + memory) / 2
-}
-
-func free(allocatable, requested int64) float64 {
-	if allocatable <= 0 || requested >= allocatable {
-		return 0
-	}
-	return float64(allocatable-requested) / float64(allocatable)
+// freeMilliCPU is the CPU left unrequested once the incoming Pod is added, in millicores,
+// not as a ratio. The ratios of CPU and memory, least-allocated's rule until now, sent most
+// pods to the slow Pi, whose memory is as large as the biggest worker's. Absolute cores favour
+// the nodes that can take the work. Negative when the node is over-requested: ranked last.
+func freeMilliCPU(n snapshot.Node, pod snapshot.Pod) int64 {
+	return n.AllocatableMilliCPU - n.RequestedMilliCPU - pod.RequestedMilliCPU
 }
