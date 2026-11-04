@@ -69,6 +69,7 @@ FIXED_SLOWDOWN = 1.0  # slowed-estimate-fixed: a node fully booked runs a pod tw
 SLOWDOWN_GRID = [i / 20 for i in range(61)]  # slowed-estimate-learned: the slowdowns tried, 0 to 3
 MIN_LOADED = 20  # pods a node must have run before its slowdown is learned; the fixed one until then
 MIN_TIMED_S = 10.0  # shorter pods do not teach the slowdown: timestamps to the second make a 2 s disk task 2 or 3 s
+MAX_SLOWDOWN_SE = 0.5  # a slowdown is learned once its standard error, at the estimates' noise SIGMA2, is below this
 PHASE = "kaptain.io/phase"
 FROZEN = ("eval", "valid")  # phases that only use the policy: the evaluation, and checkpoints along the training
 HALF_LIFE_S = 240.0  # of the discount: about a disk task on the Pi, which a shorter one would let look cheap
@@ -123,11 +124,27 @@ def limit_millicpu(pod):
     return millicores(pod["spec"]["containers"][0].get("resources", {}).get("limits", {}).get("cpu", "0"))
 
 
+def occupancy_spread(points):
+    """The sum of squares of each point's occupancy around its task's mean: what tells the slowdown
+    apart from the task's own runtime. Occupancies that do not vary within a task fit every alpha
+    as well, and the tie would keep 0."""
+    by_task = collections.defaultdict(list)
+    for task, occ, _ in points:
+        by_task[task].append(occ)
+    return sum(sum((occ - sum(occs) / len(occs)) ** 2 for occ in occs) for occs in by_task.values())
+
+
 def fit_slowdown(points):
     """The alpha of the grid that best fits log(runtime x CPU) = b_task + log(1 + alpha occ), b_task
     each task's mean, over (task, occ, log(runtime x CPU)) points. Runtime x CPU, because a pod's
     runtime goes as one over its CPU limit: bigger pods load the node more and finish sooner, which
-    would otherwise read as a node that load does not slow."""
+    would otherwise read as a node that load does not slow. None while the occupancy varies too
+    little within the tasks to pin alpha down: its standard error is about sqrt(SIGMA2 / spread),
+    spread from occupancy_spread. With earliest-finish's placements of campaign 41251873008, the
+    1-core workers reach it after 3 or 4 runs, the 8-core one, busy by a smaller fraction, after 7;
+    a node that never runs pods side by side keeps the fixed alpha."""
+    if occupancy_spread(points) < SIGMA2 / MAX_SLOWDOWN_SE ** 2:
+        return None
     best = None
     for alpha in SLOWDOWN_GRID:
         sums = collections.defaultdict(lambda: [0, 0.0, 0.0])  # task -> count, sum, sum of squares
@@ -154,17 +171,24 @@ class Load:
     def __init__(self, learn):
         self.learn = learn
         self.cores = {}  # node -> cores, from the snapshots
-        # node -> millicores requested by pods outside the experiment: the least seen, an idle
-        # node's, at the first decision of a run. The snapshot counts them, the pod list does not.
+        # node -> millicores requested by pods outside the experiment, which the snapshot counts
+        # and the pod list does not: the least a snapshot showed while the pod list had no
+        # experiment pod on the node, as at the first decision of a run. A busy node's snapshot
+        # also counts experiment pods, which record() adds again from the pod list. The pod list
+        # lags the snapshot by up to 2 s: it can miss a pod just bound, which the least forgets,
+        # but a node it shows idle has not lost a pod since. 0 until the node is seen idle.
         self.system = {}
         self.points = collections.defaultdict(lambda: collections.deque(maxlen=1000))  # node -> (task, occ, log(runtime x CPU))
         self.history = collections.defaultdict(list)  # node -> (task, runtime, occ) of each pod finished there, in order
         self.alphas = {}
 
-    def see(self, nodes):
+    def see(self, nodes, busy):
+        """Reads a snapshot's nodes, busy the nodes where the pod list has an unfinished
+        experiment pod."""
         for n in nodes:
             self.cores[n["name"]] = n["allocatable_millicpu"] / 1000
-            self.system[n["name"]] = min(self.system.get(n["name"], math.inf), n["requested_millicpu"])
+            if n["name"] not in busy:
+                self.system[n["name"]] = min(self.system.get(n["name"], math.inf), n["requested_millicpu"])
 
     def alpha(self, node):
         return self.alphas.get(node, FIXED_SLOWDOWN)
@@ -179,7 +203,7 @@ class Load:
         if node not in self.cores:  # finished before any decision saw its node: taken as it ran
             self.history[node].append((task, runtime, 0.0))
             return 0.0, False
-        occ = (self.system[node] + millicpu + others) / 1000 / self.cores[node]
+        occ = (self.system.get(node, 0.0) + millicpu + others) / 1000 / self.cores[node]
         self.history[node].append((task, runtime, occ))
         if not (self.learn and runtime >= MIN_TIMED_S and millicpu > 0):  # no limit: no work to scale by
             return occ, False
@@ -187,8 +211,9 @@ class Load:
         if len(self.points[node]) < MIN_LOADED:
             return occ, False
         alpha = fit_slowdown(self.points[node])
-        if alpha == self.alpha(node):
-            self.alphas[node] = alpha
+        if alpha is None or alpha == self.alpha(node):
+            if alpha is not None:
+                self.alphas[node] = alpha
             return occ, False
         log.info(json.dumps({"event": "kaptain_slowdown", "node": node, "alpha": alpha, "pods": len(self.points[node])}))
         self.alphas[node] = alpha
@@ -220,7 +245,9 @@ class Cluster:
         self.samples = collections.deque(maxlen=20000)  # 11 h: longer than any run
         self.unfinished = 0
         self.running = []  # (task, node, started)
-        self.seen = set()
+        self.seen = set()  # the finished pods learned from
+        self.failed = set()  # those whose learning raised: tried again at each read, logged once
+        self.busy = set()  # nodes where the last read found an unfinished experiment pod
         self.cpu = ThreadPoolExecutor(max_workers=2) if cpu else None
         self.reading = []  # the CPU reads not finished yet
         self.used = collections.deque(maxlen=20000)  # (namespace, started, finished, CPU-seconds, measured)
@@ -276,6 +303,7 @@ class Cluster:
     def read(self, pods):
         self.unfinished, self.running = 0, []
         ran = self.intervals(pods) if self.load else {}
+        self.busy = {node for node, spans in ran.items() if any(end == math.inf for _, (_, end, _) in spans)}
         for pod in pods:
             task, node = pod["metadata"]["labels"][WORKLOAD], pod["spec"].get("nodeName")
             phase = pod["status"].get("phase")
@@ -286,19 +314,29 @@ class Cluster:
                 self.running.append((task, node, stamp(states[0]["running"]["startedAt"])))
             uid = pod["metadata"]["uid"]
             if phase == "Succeeded" and uid not in self.seen and states and "terminated" in states[0]:
+                try:
+                    self.finished(task, node, pod, states[0]["terminated"], ran)
+                except Exception as error:  # not seen: the next read tries it again, and the other pods go on
+                    if uid not in self.failed:
+                        log.error(json.dumps({"event": "kaptain_learn_failed", "pod": pod["metadata"].get("name"), "error": repr(error)}))
+                    self.failed.add(uid)
+                    continue
                 self.seen.add(uid)
-                done = states[0]["terminated"]
-                runtime = stamp(done["finishedAt"]) - stamp(done["startedAt"])
-                if self.load:
-                    self.learn_alone(task, node, pod, runtime, ran)
-                else:
-                    self.estimates.update(task, node, runtime)
-                if self.cpu:
-                    limit = limit_millicpu(pod)
-                    self.reading = [f for f in self.reading if not f.done()]
-                    self.reading.append(self.cpu.submit(
-                        self.used_cpu, pod["metadata"]["namespace"], pod["metadata"]["name"],
-                        stamp(done["startedAt"]), stamp(done["finishedAt"]), limit))
+                self.failed.discard(uid)
+
+    def finished(self, task, node, pod, done, ran):
+        """Learns from a pod that finished. Everything that can raise comes before the first
+        change, so a pod that fails is not counted twice when tried again."""
+        started, ended = stamp(done["startedAt"]), stamp(done["finishedAt"])
+        limit = limit_millicpu(pod)
+        if self.load:
+            self.learn_alone(task, node, pod, ended - started, ran)
+        else:
+            self.estimates.update(task, node, ended - started)
+        if self.cpu:
+            self.reading = [f for f in self.reading if not f.done()]
+            self.reading.append(self.cpu.submit(
+                self.used_cpu, pod["metadata"]["namespace"], pod["metadata"]["name"], started, ended, limit))
 
     def learn_alone(self, task, node, pod, runtime, ran):
         """With a Load: the runtime alone into the estimates, all of the node's again when its
@@ -317,16 +355,16 @@ class Cluster:
 
     @staticmethod
     def intervals(pods):
-        """node -> (uid, (bound, finished or now, millicpu)) of every pod bound to a node: what the
+        """node -> (uid, (bound, finished or inf, millicpu)) of every pod bound to a node: what the
         snapshot's requests count."""
-        now, out = time.time(), collections.defaultdict(list)
+        out = collections.defaultdict(list)
         for pod in pods:
             node, bound = pod["spec"].get("nodeName"), bound_at(pod)
             if node is None or bound is None:
                 continue
             state = (pod["status"].get("containerStatuses") or [{}])[0].get("state", {})
             finished = state.get("terminated", {}).get("finishedAt")
-            out[node].append((pod["metadata"]["uid"], (bound, stamp(finished) if finished else now, limit_millicpu(pod))))
+            out[node].append((pod["metadata"]["uid"], (bound, stamp(finished) if finished else math.inf, limit_millicpu(pod))))
         return out
 
     def time_left(self, node, now):
@@ -392,7 +430,7 @@ class SlowedEstimate(SchedulingStrategy):
                 raise ValueError(f"node {n['name']!r} has no requested or allocatable CPU")
         out = {}
         with self.cluster.lock:
-            self.cluster.load.see(snapshot["nodes"])
+            self.cluster.load.see(snapshot["nodes"], self.cluster.busy)
             for n in snapshot["nodes"]:
                 estimate = self.cluster.estimates.get(task, n["name"])
                 if not (estimate and estimate[2]):
