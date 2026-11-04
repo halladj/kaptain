@@ -15,6 +15,8 @@ on:
           - least-allocated
           - least-used
           - shortest-estimate
+          - slowed-estimate-fixed
+          - slowed-estimate-learned
           - kaptain
 
 permissions:

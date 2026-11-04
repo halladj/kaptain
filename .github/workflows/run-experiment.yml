@@ -24,10 +24,13 @@ on:
         options:
           - current
           - dummy-random
+          - earliest-finish
           - largest-cpu-capacity
           - least-allocated
           - least-used
           - shortest-estimate
+          - slowed-estimate-fixed
+          - slowed-estimate-learned
           - kaptain
 
 permissions:

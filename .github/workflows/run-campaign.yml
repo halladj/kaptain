@@ -121,7 +121,7 @@ jobs:
                 # Kaptain frozen. The others have nothing to learn. Kaptain's checkpoints along
                 # the training run frozen on the validation seeds: whether it converges.
                 plan=()
-                if [[ $strategy == kaptain* || $strategy == shortest-estimate || $strategy == earliest-finish ]]; then
+                if [[ $strategy == kaptain* || $strategy == shortest-estimate || $strategy == earliest-finish || $strategy == slowed-estimate* ]]; then
                   for ((i = 1; i <= TRAIN_RUNS; i++)); do
                     plan+=("train $((999 + i))")
                     if [[ $strategy == kaptain* ]] && (( VALIDATE_EVERY && i % VALIDATE_EVERY == 0 )); then

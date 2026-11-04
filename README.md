@@ -132,7 +132,24 @@ instead of a random one that sends a quarter of the pods to the Pi. Pods labelle
 `kaptain.io/phase=eval` or `valid` (`KEXP_PHASE`) freeze
 the policy: best node (a tie drawn at random), no update. `shortest-estimate` is the paper's simple
 rule on the same estimates; `earliest-finish` adds the work left on each node, shared over its
-cores: the load-aware rule Kaptain must beat when contention matters. Estimates and weights live
+cores: the load-aware rule Kaptain must beat when contention matters. It queues the new pod
+behind the others, which run beside it within their limits, so it overestimates a busy node,
+the 8-core worker most.
+
+`slowed-estimate-fixed` and `slowed-estimate-learned` count no work left: they are
+shortest-estimate slowed by the load. A node's score is minus the pod's estimated runtime alone
+there, multiplied by `1 + alpha * occ`, where `occ` is the CPU requested on the node, the pod
+included, over its cores. With `-fixed`, alpha is 1 on every node: a node fully booked runs a
+pod twice as long. That overstates the slowdown of the 8-core worker, which learns about 0.3
+where the 1-core workers learn 0.6 to 0.95 (campaign 41251873008, replayed): `-fixed` is the
+naive baseline and still penalises that worker the most. With `-learned`, alpha is fitted per
+node on the pods of 10 s or more that finished there, each with the occupancy when it was bound,
+and is 1 until 20 have (`kaptain_slowdown` in the decider's log). Both learn the runtime alone,
+each runtime divided by its slowdown, so the load is not counted twice; when a node's alpha
+changes, its estimates are computed again from the runtimes kept. `-ef` keeps
+`earliest-finish`'s prior.
+
+Estimates and weights live
 in the decider's memory: a redeployment starts from scratch, but each update logs the weights
 (`kaptain_checkpoint`). `KAPTAIN_SEED` (default 7) seeds
 Kaptain's networks and sampling, for independent trainings of one policy.
@@ -162,9 +179,12 @@ k8s/         manifests
 
 **A fallback is a result.** A policy that crashes, times out, or names a node outside the
 candidate list must never become an invisible random baseline. The plugin validates every
-answer and falls back explicitly — highest mean remaining CPU/memory request ratio once the
-incoming Pod is added, then allocatable CPU, then node name. That is the same definition as
-the `least-allocated` strategy, so the fallback matches the name it carries. The rule lives
+answer and falls back explicitly — `most-free-cpu-requests`: the most millicores left
+unrequested once the incoming Pod is added, then allocatable CPU, then node name. Absolute
+cores, not a ratio: until now it was the `least-allocated` strategy, whose CPU and memory ratios
+sent most pods to the slow Pi. Memory no longer counts: Kubernetes' Filter has already removed
+the nodes the pod does not fit. Fallback rates are therefore not comparable with campaigns run
+before this change. The rule lives
 **in Go, because it runs exactly when the decider is what failed**. It is logged, counted,
 and kept in the results; when it ranked on resources a node reported missing, the decision
 line names those nodes in `fallback_blind_nodes`.
