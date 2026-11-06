@@ -21,7 +21,9 @@ if [[ -n $(git status --porcelain -- bridge/) ]]; then
   echo 'Commit the policy code before deploying.' >&2
   exit 1
 fi
-container=kaptain-k3s
+kubectl=${KEXP_KUBECTL:-docker exec -i kaptain-k3s kubectl --server=https://10.50.0.1:6443}
+ctr=${KAPTAIN_CTR:-docker exec -i kaptain-k3s ctr}
+master=${KAPTAIN_MASTER:-alex-master}
 run_id="deploy-${GITHUB_RUN_ID:-$(date -u +%s)}-${GITHUB_RUN_ATTEMPT:-1}"
 # One tag per deployment, not per workflow run: a campaign deploys many times in one run, and
 # a decider whose spec did not change is not restarted, so Kaptain would keep what it learned.
@@ -30,13 +32,11 @@ changing=0
 recovery='Not needed'
 
 k() {
-  docker exec "$container" kubectl --server=https://10.50.0.1:6443 \
-    --request-timeout=20s -n kube-system "$@"
+  $kubectl --request-timeout=20s -n kube-system "$@" </dev/null
 }
 # The same, reading stdin: kubectl runs in the K3s container, which sees no file of this checkout.
 ki() {
-  docker exec -i "$container" kubectl --server=https://10.50.0.1:6443 \
-    --request-timeout=20s -n kube-system "$@"
+  $kubectl --request-timeout=20s -n kube-system "$@"
 }
 ready() {
   k rollout status "deployment/$1" --timeout=180s
@@ -63,12 +63,12 @@ cleanup_images() {
   done
   # Untagged leftovers of earlier decider builds (failed or superseded): ours by label only.
   docker image prune -f --filter label=kaptain.io/component=decider >/dev/null || return 1
-  images=$(docker exec "$container" ctr images list -q) || return 1
+  images=$($ctr images list -q </dev/null) || return 1
   for reference in $images; do
     old=${reference#docker.io/library/}
     [[ $old == kaptain-decider:* ]] || continue
     [[ $old == "$image" || $old == "$previous_image" ]] && continue
-    docker exec "$container" ctr images rm "$reference" || return 1
+    $ctr images rm "$reference" </dev/null || return 1
   done
 }
 finish() {
@@ -127,7 +127,7 @@ docker build --label "org.opencontainers.image.revision=$commit" --label kaptain
   -t "$image" bridge/
 docker run --rm --network none -e "STRATEGY=$strategy" -e OPENAI_API_KEY "$image" \
   uv run --no-sync python -c 'import app; print(app.healthz())'
-docker save "$image" | docker exec -i "$container" ctr images import -
+docker save "$image" | $ctr images import -
 
 # Pause scheduling while the two components switch policies.
 changing=1
@@ -160,7 +160,7 @@ ready kaptain-scheduler
 
 # Scheduler readiness also checks that the decider reports the same policy.
 selector='app in (kaptain-decider,kaptain-scheduler)'
-off_master=$(k get pods -l "$selector" --field-selector=spec.nodeName!=alex-master -o name)
+off_master=$(k get pods -l "$selector" --field-selector="spec.nodeName!=$master" -o name)
 [[ -z "$off_master" ]] || { echo "Kaptain pods are outside the master: $off_master" >&2; exit 1; }
 k get pods -l "$selector" -o wide
 

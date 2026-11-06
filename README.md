@@ -105,6 +105,38 @@ scheduler looks like.
 **Durations** accept a Go duration string (`2s`, `500ms`) or a bare number of seconds, and an
 unparseable value fails at startup rather than becoming a default.
 
+## Install with Vagrant
+
+1. Install [VirtualBox](https://www.virtualbox.org/) (7.1+) and [Vagrant](https://developer.hashicorp.com/vagrant/install) (2.4.9+).
+2. Run:
+
+```bash
+git clone https://github.com/leopoldch/kaptain.git
+cd kaptain
+vagrant up
+```
+
+The results land in `results/`. Needs about 12 GB of free RAM, 25 GB of disk and Internet.
+
+```bash
+vagrant ssh master -c 'journalctl -fu kaptain-campaign'      # follow the campaign
+vagrant provision master --provision-with experiments        # run again
+vagrant provision master --provision-with setup,experiments  # run again on a new commit
+vagrant destroy -f                                           # delete everything
+```
+
+- **Settings:** nodes and campaign are in `vagrant.yaml`. The default campaign takes a day or more.
+- **Code:** the VMs run the last commit, not uncommitted changes.
+- **`-llm` policies:** `cp .env.example .env` and add your own OpenAI key, or they are skipped. Each
+  costs about 1,800 calls per experiment, so use a dedicated key with prepaid credits.
+- **Results:** these VMs reproduce the procedure, not the real cluster's times (see below).
+- **`<inaccessible>` error:** remove the stale VM with `VBoxManage unregistervm <uuid>`.
+- **Tested on:** Linux amd64. macOS and Windows are not verified yet.
+
+The VMs differ from the real cluster: the Pi is only imitated (`worker-pi`, amd64), no VPN, one
+machine's CPU and disk shared by all, and the master runs no experiment pods. Compare policies with each other, not with the real
+cluster's numbers. `-llm` runs also vary from one execution to the next.
+
 ## Add a policy
 
 Strategies live in `bridge/strategies/`, one class per file extending the
