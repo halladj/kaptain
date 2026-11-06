@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $(uname -m) == x86_64 ]] && ! grep -qw avx /proc/cpuinfo; then
+  echo 'This VM has no AVX, which stress-ng needs. On Windows: disable Hyper-V (see the README).' >&2
+  exit 1
+fi
+
 swapoff -a
 sed -i '/\sswap\s/d' /etc/fstab
 

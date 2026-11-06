@@ -8,6 +8,11 @@ fi
 
 read_key() {
   [[ -f /vagrant/.env ]] || return 0
+  # What > writes in Windows PowerShell 5.1: sed would find no key in it.
+  if [[ $(head -c 2 /vagrant/.env | od -An -tx1) == ' ff fe' ]]; then
+    echo '.env is in UTF-16: save it as UTF-8. Nothing started.' >&2
+    exit 1
+  fi
   # A .env written on Windows may start with a BOM and end its lines with \r.
   sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' /vagrant/.env |
     sed -n 's/^OPENAI_API_KEY=//p' | tail -n 1 | sed -e 's/^"//' -e 's/"$//'

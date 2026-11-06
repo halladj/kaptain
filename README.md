@@ -131,7 +131,10 @@ vagrant destroy -f                                           # delete everything
   costs about 1,800 calls per experiment, so use a dedicated key with prepaid credits.
 - **Results:** these VMs reproduce the procedure, not the real cluster's times (see below).
 - **`<inaccessible>` error:** remove the stale VM with `VBoxManage unregistervm <uuid>`.
-- **Tested on:** Linux amd64. macOS and Windows are not verified yet.
+- **Tested on:** Linux amd64, macOS and Windows.
+- **Windows:** disable Hyper-V (`bcdedit /set hypervisorlaunchtype off` as administrator, then
+  restart): under it, the VMs have no AVX, which `stress-ng` needs. Docker Desktop on WSL2 and WSL
+  stop working until you set it back to `auto` and restart.
 
 The VMs differ from the real cluster: the Pi is only imitated (`worker-pi`, amd64), no VPN, one
 machine's CPU and disk shared by all, and the master runs no experiment pods. Compare policies with each other, not with the real
