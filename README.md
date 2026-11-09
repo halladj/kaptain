@@ -1,260 +1,147 @@
 # Kaptain
 
-Plugs ML/RL/LLM placement policies into a real Kubernetes scheduling path, and measures what
-each decision costs.
+Kaptain places Kubernetes pods on a cluster whose machines differ: fast VMs, small VMs, a
+Raspberry Pi, a Jetson. For each kind of task and each node, it learns how long the task takes
+there. A reinforcement-learning policy (PPO) then picks the node, and an LLM can score the
+cluster's state to guide its training.
 
-**Every policy is written in Python**, in `bridge/`. The Go side is the integration and
-nothing else: a Scheduling Framework plugin that builds the snapshot, asks the decider over
-HTTP, and turns the answer into scores. It is compiled against **Kubernetes v1.31.0**, which
-must match `kind-cluster.yaml` and the scheduler image.
+Research project for IFT-7026, Université Laval, by Léopold Chappuis and Alexandre Eberhardt.
+Every number below was measured on our own K3s cluster, not in a simulator.
 
-```
-                    ┌──────────────── kube-scheduler ────────────────┐
-                    │                                                │
- Pod ──► Filter ────┼──► PreScore ────────────────► Score ───────────┼──► Bind ──► PostBind
-       (Kubernetes) │    snapshot, then one call    lookup, per node │ (Kubernetes)    │
-                    │        │            ▲                          │           log where
-                    └────────┼────────────┼──────────────────────────┘           it landed
-                             │            │
-                      POST /decide   scores, and the name
-                             │       of what actually scored
-                             ▼            │
-                    ┌────────────────────────────┐
-                    │  bridge/  Python decider   │
-                    │  the policy: heuristic,    │
-                    │  RL, LLM — all of them     │
-                    └────────────────────────────┘
-```
+## Results
 
-**We only score.** Filtering is Kubernetes' job and stays untouched, binding is Kubernetes'
-job, and the plugin expresses its decision as a score, never as a constraint. It trains
-nothing, reserves nothing, evicts nothing, preempts nothing.
+- **Knowing how long a task takes on each node gives most of the gain.** On the edge cluster,
+  rules that use these runtime estimates halve the mean delay of a pod compared with
+  least-allocated (43 to 45 s instead of 85 s), and use 36 to 41% less CPU per pod.
+- **The learned policy does not beat these rules yet.** Trained from scratch, it is unstable:
+  only 1 training in 4 got close to the rules (Figure 2). Started from the earliest-finish rule,
+  it is stable but ends level with it.
+- **The LLM has no measurable effect yet.** On the 4-worker cluster, Kaptain with the LLM's
+  bonus does no better than with a random bonus of the same kind. On the edge cluster it has the
+  lowest mean delay (42.3 s), but within the noise of earliest-finish (43.5 s).
+- **On the 4-worker cluster, avoiding the Pi is almost all that matters.** Once pods stay off
+  it, which VM they go to barely changes their delay, so there is little left to learn there.
+  That is why we moved to the edge cluster: without the 8-vCPU VM, placement has to trade
+  between slow nodes and busy ones.
 
-`PreScore` is not a second decision: `Score` is called once per node, in parallel, so the
-snapshot is built and the decider called once per scored pod there instead. With only one
-eligible node, kube-scheduler selects it directly in Go and skips scoring and the Python
-call. Its binding log has `scored: false`; no policy decision or latency is recorded.
-`PostBind` records where the pod landed — on a score tie kube-scheduler picks at random.
+![Mean delay and CPU per pod, per policy, on the edge cluster](figures/policies-edge.png)
 
-## Where the timers sit
+**Figure 1. Edge cluster.** Mean delay of a pod (from its creation to its end) and the CPU time
+it used, over 5 evaluation seeds. Kaptain starts from earliest-finish and is trained 3 times
+independently, 10 runs each. Bars are 95% intervals, over the seeds, or over the trainings for
+Kaptain. Campaign
+[42422003977](https://github.com/leopoldch/kaptain/actions/runs/42422003977).
 
-Go measures the complete decider call. Python's `handler_duration` measures only
-`strategy.scores()`, excluding request parsing and response serialization.
+![Validation delay along training](figures/learning.png)
 
-```
-   scheduler ├──────── kaptain_plugin_decider_duration_seconds ────────┤
-             │                                                         │
-             └─ serialise ─► HTTP ─►├── kaptain_decider_ ──┤◄─ HTTP ◄──┘
-                                    │  handler_duration    │
-                                    └──── decider ─────────┘
+**Figure 2. 4-worker cluster: Kaptain along its training.** Each line is one training, frozen
+every 10 training runs and replayed on two validation seeds. From scratch (orange), 1 training
+in 4 reaches earliest-finish. Started from earliest-finish (blue), all 3 stay level with it.
+Campaigns [40798185088](https://github.com/leopoldch/kaptain/actions/runs/40798185088),
+[40903982901](https://github.com/leopoldch/kaptain/actions/runs/40903982901) and
+[41251873008](https://github.com/leopoldch/kaptain/actions/runs/41251873008).
 
-   non-policy overhead = decider_duration − handler_duration
-```
+**4-worker cluster**, same workload, mean over the 5 evaluation seeds:
 
-This overhead includes serialization, HTTP, FastAPI dispatch and response decoding; it is
-not a measurement of network latency alone. Compare means over the same successful calls,
-not independently computed percentiles.
+| Policy | Mean delay (s) | CPU per pod (CPU-s) |
+|---|---:|---:|
+| least-allocated | 40.1 | 10.2 |
+| Kubernetes default scheduler | 38.1 | 10.0 |
+| shortest-estimate | 27.9 | 8.4 |
+| earliest-finish | 28.9 | 8.5 |
+| Kaptain, from scratch (3 trainings × 40 runs) | 98.5 | 13.3 |
+| Kaptain, from earliest-finish (3 × 20) | 29.1 | 8.8 |
+| … + LLM bonus | 30.2 | 9.0 |
+| … + random bonus | 29.9 | 9.0 |
 
-No number is quoted here yet. The only measurement so far predates the changes that moved
-the scheduler and the decider onto the control plane and disabled the native PreScore
-plugins, so it no longer describes this code.
+The first five rows come from campaign 40903982901, the last three from 41251873008.
 
-## Run
+### Setup
 
-Prerequisites: Docker, `kind`, `kubectl`, `uv`.
+| | 4-worker cluster | Edge cluster |
+|---|---|---|
+| Nodes | one 8-vCPU VM, two 1-vCPU VMs, Raspberry Pi 5 | the 4-vCPU master (a VPS), Jetson Orin Nano, two 1-vCPU VMs, Raspberry Pi 5 |
+| Network | WireGuard VPN, K3s v1.31 | same |
 
-```bash
-make all-plugin      # cluster + both images + deploy + demo pod
-make verify-plugin   # where the pod landed, and who scheduled it
-make logs-plugin     # one JSON line per decision
-make logs-decider
-make down
-```
+- **Workload:** 60 `stress-ng` pods per run, one every 5 s, a third each CPU, memory and disk
+  tasks, each with a CPU limit between 200 and 500 millicores.
+- **Seeds:** a seed fixes the pods and their arrival times. Every policy runs the same 5
+  evaluation seeds. The policies that learn first train on other seeds, then run frozen.
+- **The rules:**
+  - least-allocated: picks the node with the most unrequested CPU and memory.
+  - shortest-estimate: picks the node where the task's estimated runtime is shortest.
+  - earliest-finish: adds to that estimate the work already running on the node, shared over
+    its cores.
 
-The scheduler refuses to start without a decider, so `deploy-plugin` brings up both.
+## Reproduce with Vagrant
 
-```bash
-make metrics-plugin    # kaptain_plugin_* on the scheduler
-make metrics-decider   # kaptain_decider_* on the decider
-```
-
-Plugin environment: `KAPTAIN_DECIDER_URL` (**required**) and `KAPTAIN_DECIDER_TIMEOUT`,
-`KAPTAIN_STRATEGY` (the run's declared identity, and the metric label), `KAPTAIN_SEED`,
-`KAPTAIN_TELEMETRY` (`kubelet` or `off`) with `KAPTAIN_TELEMETRY_REFRESH`,
-`KAPTAIN_TELEMETRY_MAX_AGE` and `KAPTAIN_TELEMETRY_MAX_SOURCE_STALE`, `RUN_ID`,
-`POLICY_VERSION`.
-
-The two telemetry limits are not the same thing. `MAX_AGE` bounds how long ago we received a
-sample; `MAX_SOURCE_STALE` bounds how long the kubelet has been repeating one measurement
-timestamp. A frozen stats pipeline keeps answering, so every poll refreshes the first and
-only the second notices.
-
-Measured node usage comes directly from each kubelet's `/stats/summary`, through the API
-server proxy. The scheduler caches these samples in the background; a scheduling decision
-never calls a kubelet. The prototype's `nodes/proxy` permission is broad and can expose other
-kubelet proxy endpoints.
-
-Decider environment: `STRATEGY`, and nothing else. Everything the baselines need arrives in
-the request body; only the Kaptain strategies also list the experiment pods, to learn
-runtimes and count the unfinished ones (`k8s/decider-rbac.yaml`). It reports on every `/decide` the
-name of what actually ran. The plugin **refuses to start** if that name disagrees with
-`KAPTAIN_STRATEGY`, and refuses the decision — explicit fallback, `strategy_mismatch` — if
-they come to disagree afterwards, which is what a decider redeployed under a running
-scheduler looks like.
-
-**Durations** accept a Go duration string (`2s`, `500ms`) or a bare number of seconds, and an
-unparseable value fails at startup rather than becoming a default.
-
-## Install with Vagrant
-
-1. Install [VirtualBox](https://www.virtualbox.org/) (7.1+) and [Vagrant](https://developer.hashicorp.com/vagrant/install) (2.4.9+).
-2. Run:
+Vagrant builds a cluster of VMs on your machine and runs a whole campaign by itself. You need
+[VirtualBox](https://www.virtualbox.org/) 7.1+ and
+[Vagrant](https://developer.hashicorp.com/vagrant/install) 2.4.9+, about 12 GB of free RAM,
+25 GB of disk, and Internet.
 
 ```bash
 git clone https://github.com/leopoldch/kaptain.git
 cd kaptain
+cp .env.example .env    # then put your OpenAI API key in it: OPENAI_API_KEY=sk-...
 vagrant up
 ```
 
-The results land in `results/`. Needs about 12 GB of free RAM, 25 GB of disk and Internet.
+**The OpenAI API key** is needed for the LLM policies (the names ending in `-llm` or
+`-llm-ef`): `vagrant up` checks it with OpenAI before starting, and stops if it is refused.
+Without a `.env`, these policies are skipped and the summary says so; the other policies run as
+usual. Each LLM policy makes about 1,800 calls per experiment, so use a dedicated key with
+prepaid credits. The key is kept in a Kubernetes secret inside the VMs, not in `results/`.
+
+`vagrant up` creates a master and four workers, installs K3s, builds and deploys Kaptain, checks
+it with a short smoke test, then starts the campaign in the background. The results land in
+`results/<date>/campaign/`: one folder per run, `summary.md` with the tables, and `plots/`.
+
+**First try:** the default campaign takes a day or more. For a run of under an hour, set this
+in `vagrant.yaml` before `vagrant up`:
+
+```yaml
+campaign:
+  experiments: even-5s
+  strategies: earliest-finish least-allocated
+  seeds: 7
+  train_runs: 2
+  replicates: 1
+  validate_every: 0
+```
 
 ```bash
 vagrant ssh master -c 'journalctl -fu kaptain-campaign'      # follow the campaign
-vagrant provision master --provision-with experiments        # run again
-vagrant provision master --provision-with setup,experiments  # run again on a new commit
+vagrant provision master --provision-with experiments        # run it again
+vagrant provision master --provision-with setup,experiments  # again, on a new commit
 vagrant destroy -f                                           # delete everything
 ```
 
-- **Settings:** nodes and campaign are in `vagrant.yaml`. The default campaign takes a day or more.
-- **Code:** the VMs run the last commit, not uncommitted changes.
-- **`-llm` policies:** `cp .env.example .env` and add your own OpenAI key, or they are skipped. Each
-  costs about 1,800 calls per experiment, so use a dedicated key with prepaid credits.
-- **Results:** these VMs reproduce the procedure, not the real cluster's times (see below).
-- **`<inaccessible>` error:** remove the stale VM with `VBoxManage unregistervm <uuid>`.
+- **Nodes:** their number, cores and speed are in `vagrant.yaml`. `cpu_cap` slows a node down.
+- **Code:** the VMs run the last commit, not your uncommitted changes.
+- **What it reproduces:** the procedure, not our numbers. The VMs share one machine's CPU and
+  disk, and the Pi is only imitated with a CPU cap: it is not slow on disk, as the real one is.
+  Compare the policies with each other, not with the tables above.
 - **Tested on:** Linux amd64, macOS and Windows.
 - **Windows:** disable Hyper-V (`bcdedit /set hypervisorlaunchtype off` as administrator, then
-  restart): under it, the VMs have no AVX, which `stress-ng` needs. Docker Desktop on WSL2 and WSL
-  stop working until you set it back to `auto` and restart.
+  restart). Under it, the VMs have no AVX, which `stress-ng` needs. Docker Desktop on WSL2 and
+  WSL stop working until you set it back to `auto` and restart.
+- **`<inaccessible>` error:** remove the stale VM with `VBoxManage unregistervm <uuid>`.
 
-The VMs differ from the real cluster: the Pi is only imitated (`worker-pi`, amd64), no VPN, one
-machine's CPU and disk shared by all, and the master runs no experiment pods. Compare policies with each other, not with the real
-cluster's numbers. `-llm` runs also vary from one execution to the next.
+### Our numbers, from our raw data
 
-## Add a policy
-
-Strategies live in `bridge/strategies/`, one class per file extending the
-`SchedulingStrategy` ABC. The baselines are pure functions of the snapshot. Adding one needs
-**no Go change and no scheduler rebuild**.
-
-Our approach is `bridge/strategies/kaptain.py`, the paper's three parts without the LLM:
-Gaussian runtime estimates per task and node, one network that scores every node from its
-features (any node count), and a separate critic. It learns once per training run: PPO with
-generalized advantages, discounted over time (half-life 240 s), the run ending when its last pod
-finishes. This is a new variant: until f53745f, Kaptain learned with one-step A2C at every
-decision. The CPU cost is what the experiment pods used, the CPU time each one's stress-ng
-reports. Between runs kexp calls the decider's `POST /settle`: the run that ended is learned
-from before the next one starts, and a `valid` run starts from the training's runtime estimates
-and leaves them unchanged. The weights are in the name:
-`kaptain-b0.5-l1` pays 0.5 per CPU-second and adds the hand-written bonus with lambda = 1
-(Phi = minus the predicted time left); `kaptain` is delay only. `-llm` takes Phi from an LLM
-instead (`OPENAI_API_KEY`), and `-placebo` draws it at random over the LLM's range, a bonus as
-large without information: `kaptain-l4-llm` against `kaptain-l4-placebo` tells whether the LLM's
-scores, not the bonus itself, help. Every decision logs the state as the LLM reads it and the
-hand-written Phi, so that any Phi can be scored offline against what the state actually cost.
-`-ef`, last in the name (`kaptain-ef`), starts the policy from earliest-finish: the network only
-learns a correction to its scores, zero at first, so the untrained policy is earliest-finish,
-instead of a random one that sends a quarter of the pods to the Pi. Pods labelled
-`kaptain.io/phase=eval` or `valid` (`KEXP_PHASE`) freeze
-the policy: best node (a tie drawn at random), no update. `shortest-estimate` is the paper's simple
-rule on the same estimates; `earliest-finish` adds the work left on each node, shared over its
-cores: the load-aware rule Kaptain must beat when contention matters. It queues the new pod
-behind the others, which run beside it within their limits, so it overestimates a busy node,
-the 8-core worker most.
-
-`slowed-estimate-fixed` and `slowed-estimate-learned` count no work left: they are
-shortest-estimate slowed by the load. A node's score is minus the pod's estimated runtime alone
-there, multiplied by `1 + alpha * occ`, where `occ` is the CPU requested on the node, the pod
-included, over its cores. With `-fixed`, alpha is 1 on every node: a node fully booked runs a
-pod twice as long. That overstates the slowdown of the 8-core worker, which learns about 0.3
-where the 1-core workers learn 0.6 to 0.95 (campaign 41251873008, replayed): `-fixed` is the
-naive baseline and still penalises that worker the most. With `-learned`, alpha is fitted per
-node on the pods of 10 s or more that finished there, each with the occupancy when it was bound,
-and is 1 until 20 have (`kaptain_slowdown` in the decider's log). Both learn the runtime alone,
-each runtime divided by its slowdown, so the load is not counted twice; when a node's alpha
-changes, its estimates are computed again from the runtimes kept. `-ef` keeps
-`earliest-finish`'s prior.
-
-Estimates and weights live
-in the decider's memory: a redeployment starts from scratch, but each update logs the weights
-(`kaptain_checkpoint`). `KAPTAIN_SEED` (default 7) seeds
-Kaptain's networks and sampling, for independent trainings of one policy.
+Every campaign on the real cluster keeps its raw runs as a GitHub artifact. To get the tables
+above from them, with their intervals:
 
 ```bash
-# edit STRATEGY in k8s/decider.yaml and KAPTAIN_STRATEGY in k8s/scheduler-plugin.yaml to match
-kubectl apply -f k8s/decider.yaml
-kubectl apply -f k8s/scheduler-plugin.yaml
+gh run download 42422003977 -D results/42422003977
+python3 workloads/ktable.py results/42422003977
 ```
 
-## Layout
+On the real cluster, campaigns start from **Actions → Run campaign**.
 
-```
-plugin/      the integration, Go — module `kaptain`, not published
-  scoring/     extension points, decision, fallback, metrics
-  snapshot/    the wire contract with the decider
-  decider/     the HTTP client
-  telemetry/   measured node usage, refreshed in the background
-bridge/      the decider, Python — every policy lives here
-  strategies/  one class per policy
-k8s/         manifests
-```
+## More
 
-`docs/` and `experiments/` are on disk but not committed for now.
-
-## Three rules
-
-**A fallback is a result.** A policy that crashes, times out, or names a node outside the
-candidate list must never become an invisible random baseline. The plugin validates every
-answer and falls back explicitly — `most-free-cpu-requests`: the most millicores left
-unrequested once the incoming Pod is added, then allocatable CPU, then node name. Absolute
-cores, not a ratio: until now it was the `least-allocated` strategy, whose CPU and memory ratios
-sent most pods to the slow Pi. Memory no longer counts: Kubernetes' Filter has already removed
-the nodes the pod does not fit. Fallback rates are therefore not comparable with campaigns run
-before this change. The rule lives
-**in Go, because it runs exactly when the decider is what failed**. It is logged, counted,
-and kept in the results; when it ranked on resources a node reported missing, the decision
-line names those nodes in `fallback_blind_nodes`.
-
-**Absence is declared.** A value that cannot be read is `missing`, never zero. Two ages,
-never one: requested resources and measured usage go stale at different rates.
-
-**`intended_node` is not the placement.** On a score tie kube-scheduler picks at random, so
-`PostBind` logs the node actually bound, beside `tie_count`.
-
-```json
-{"run_id": "unset", "integration": "plugin", "strategy": "dummy-random",
- "decider_strategy": "dummy-random", "intended_node": "worker-2", "tie_count": 1,
- "fallback": false, "durations_ms": {"snapshot": 0.012, "decider": 1.41, "total": 1.43}}
-```
-
-`fallback_reason` is `decider_error`, `strategy_mismatch`, `invalid_score` or
-`no_candidates`. The decision line carries both `policy_scores` — what the decider answered,
-kept even when it was refused — and `effective_scores`, which is what Kubernetes ranked on.
-Set `RUN_ID` and `POLICY_VERSION` so the lines can be joined with a run.
-
-## Testbed
-
-kind runs every node as a container on **one** machine: right for wiring, fallbacks and
-decision-cost pilots, wrong for placement-performance claims. The `hw-class`/`cpu-gen` labels
-are cosmetic. Main results need separate Linux VMs, ideally one per node.
-
-## Checks
-
-```bash
-make check            # gofmt, go vet, and every manifest through the Kubernetes YAML decoder
-```
-
-There is no test suite: this is a research prototype. With one implementation of each policy
-there is also no parity to keep.
-
-The extender this project used to carry as a second integration was measured against the
-plugin, lost, and was removed. It is frozen on `archive/extender`.
+- [DESIGN.md](DESIGN.md): how the scheduler plugin and the decider work, every policy, the
+  logs, and how to run them on a local `kind` cluster.
+- [workloads/README.md](workloads/README.md): the experiments and the tools that run them.
