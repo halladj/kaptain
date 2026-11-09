@@ -63,7 +63,7 @@ memory_mib = [64, 1024]  # optional, otherwise the manifest's value
 | `packing-random` | Christensen et al. 2025: pods with random CPU and RAM | ranges and Poisson rate are ours |
 | `decision-cost` | Zhou et al. 2026: no-op pods | shape of the September pilot |
 | `web` | Zhou et al. 2026: NGINX services | 60 s lifetime, Poisson rate are ours |
-| `even-10s`, `even-5s` | `drs-even`, one pod every 10 or 5 s: contention matters | the faster arrivals are ours |
+| `even-10s`, `even-5s`, `even-2s` | `drs-even`, one pod every 10, 5 or 2 s: contention matters | the faster arrivals are ours |
 | `calibration` | each task alone, 5 of each, 240 s apart, 500m: with `KEXP_PIN`, one node at a time | ours |
 | `calibration-load` | the same under contention: 4 of each, 10 s apart, on one node at a time | ours |
 | `smoke` | pipeline check only | — |
